@@ -1,5 +1,5 @@
 """Build the DCF valuation workbook (Assumptions, Segment_Revenue, Working_Capital, Capex, WACC, DCF,
-Scenarios, Sensitivity, Comps tabs).
+Scenarios, Sensitivity, Comps, Summary tabs).
 
 Run:  python dcf_model/build_dcf_model.py   ->   dcf_model/DCF_Model.xlsx
 Requires LibreOffice (soffice) on PATH: the workbook is recalculated headless once per scenario to
@@ -18,6 +18,7 @@ from datetime import date
 from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
+from openpyxl.chart import BarChart, Reference
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.workbook.defined_name import DefinedName
 from openpyxl.worksheet.datavalidation import DataValidation
@@ -251,6 +252,26 @@ CP_OUT_COLS_ROW = CP_OUT_HDR + 1
 CP_OUT_FIRST = CP_OUT_COLS_ROW + 1
 CP_OUT_DCF_PGM = CP_OUT_FIRST + len(CP_MULTIPLES)
 CP_OUT_DCF_EXIT = CP_OUT_DCF_PGM + 1
+
+# ---- Summary tab layout (one landscape page: B:E left, G:L right, N = chart helper) ----
+SM = "Summary"
+SM_TOP_HDR = 4
+SM_COMPANY, SM_TICKER, SM_SCEN, SM_PRICE, SM_DCF_PGM, SM_DCF_EXIT, SM_UP_PGM, SM_UP_EXIT, SM_WACC = \
+    range(SM_TOP_HDR + 1, SM_TOP_HDR + 10)
+SM_FY, SM_REV, SM_EBIT, SM_FCF = range(SM_TOP_HDR + 1, SM_TOP_HDR + 5)
+SM_TV_COLS = SM_FCF + 2
+SM_TV_PCT, SM_IMPL_MULT, SM_IMPL_G = range(SM_TV_COLS + 1, SM_TV_COLS + 4)
+SM_RANGE_HDR = SM_WACC + 2
+SM_RANGE_COLS = SM_RANGE_HDR + 1
+SM_RANGE_FIRST = SM_RANGE_COLS + 1
+SM_RANGE_LAST = SM_RANGE_FIRST + 2 + len(CP_MULTIPLES) - 1  # DCF x2 + comps multiples (charted rows)
+SM_RANGE_PRICE = SM_RANGE_LAST + 1
+SM_THESIS_HDR = SM_RANGE_PRICE + 2
+SM_THESIS_FIRST = SM_THESIS_HDR + 1
+SM_NOTE_LINES = 3
+SM_RISK_HDR = SM_THESIS_FIRST + SM_NOTE_LINES + 1
+SM_RISK_FIRST = SM_RISK_HDR + 1
+SM_LAST_ROW = SM_RISK_FIRST + SM_NOTE_LINES - 1
 
 
 def put(ws, ref, value, color=BLACK, fmt=None, bold=False, italic=False, fill=None, size=10):
@@ -1148,6 +1169,125 @@ def build_comps(wb):
     ws.sheet_properties.pageSetUpPr.fitToPage = True
 
 
+def build_summary(wb):
+    ws = wb.create_sheet(SM)
+    ws.sheet_view.showGridLines = False
+    for col, width in zip("ABCDEFGHIJKLMN", (2, 40, 13, 13, 13, 3, 34, 11, 11, 11, 11, 11, 3, 22)):
+        ws.column_dimensions[col].width = width
+    put(ws, "B1", '=CompanyName&" - Valuation Summary"', bold=True, size=14)
+    put(ws, "B2", f'="("&Units&" except per-share data; active scenario: "&{A}!$C${A_SCEN}&")"', italic=True)
+
+    # 1. Header block
+    section(ws, SM_TOP_HDR, "Valuation Snapshot", last="E")
+    for r, label, f, color, fmt in (
+            (SM_COMPANY, "Company Name", f"={A}!$C${A_COMPANY}", GREEN, None),
+            (SM_TICKER, "Ticker", f"={A}!$C${A_TICKER}", GREEN, None),
+            (SM_SCEN, "Scenario Selected", f"={A}!$C${A_SCEN}", GREEN, None),
+            (SM_PRICE, "Current Share Price ($) (Mkt Cap / Shares)",
+             f"=IF({A}!$C${A_SHARES}=0,0,{A}!$C${A_MCAP}/{A}!$C${A_SHARES})", BLACK, FMT_PRICE),
+            (SM_DCF_PGM, "Implied Share Price - DCF Perpetuity Growth ($)", f"={D}!$C${D_PRICE}", GREEN, FMT_PRICE),
+            (SM_DCF_EXIT, "Implied Share Price - DCF Exit Multiple ($)", f"={D}!$D${D_PRICE}", GREEN, FMT_PRICE),
+            (SM_UP_PGM, "Upside / (Downside) - DCF Perpetuity Growth",
+             f"=IF(C{SM_PRICE}=0,0,C{SM_DCF_PGM}/C{SM_PRICE}-1)", BLACK, FMT_PCT),
+            (SM_UP_EXIT, "Upside / (Downside) - DCF Exit Multiple",
+             f"=IF(C{SM_PRICE}=0,0,C{SM_DCF_EXIT}/C{SM_PRICE}-1)", BLACK, FMT_PCT),
+            (SM_WACC, "WACC", f"={K}!$C${K_WACC}", GREEN, FMT_PCT)):
+        put(ws, f"B{r}", label)
+        c = put(ws, f"C{r}", f, color=color, fmt=fmt)
+        c.alignment = Alignment(horizontal="right")
+
+    # 4. Key outputs (right block)
+    section(ws, SM_TOP_HDR, "Key Outputs", first="G", last="L")
+    put(ws, f"G{SM_FY}", "Fiscal Year", bold=True, fill=HEADER_FILL)
+    for r, label, src, row in ((SM_REV, "Revenue ($mm)", S, S_SUM_REV), (SM_EBIT, "EBIT ($mm)", S, S_SUM_EBIT),
+                               (SM_FCF, "Unlevered Free Cash Flow ($mm)", D, D_UFCF)):
+        put(ws, f"G{r}", label)
+        for col, src_col in zip("HIJKL", PROJ_COLS):
+            put(ws, f"{col}{r}", f"={src}!{src_col}{row}", color=GREEN, fmt=FMT_USD)
+    for col, src_col in zip("HIJKL", PROJ_COLS):
+        c = put(ws, f"{col}{SM_FY}", f"={S}!{src_col}{S_FY}", color=GREEN, bold=True, fill=HEADER_FILL)
+        c.alignment = Alignment(horizontal="right")
+    for col, text in (("G", "Terminal Value Cross-Checks"), ("H", "Perpetuity"), ("I", "Exit Multiple")):
+        c = put(ws, f"{col}{SM_TV_COLS}", text, bold=True, fill=HEADER_FILL)
+        c.alignment = Alignment(horizontal="left" if col == "G" else "right")
+    put(ws, f"G{SM_TV_PCT}", "PV of Terminal Value (% of EV)")
+    put(ws, f"H{SM_TV_PCT}", f"={D}!$C${D_TV_PCT}", color=GREEN, fmt=FMT_PCT)
+    put(ws, f"I{SM_TV_PCT}", f"={D}!$D${D_TV_PCT}", color=GREEN, fmt=FMT_PCT)
+    put(ws, f"G{SM_IMPL_MULT}", "Implied Exit EV/EBITDA (perpetuity)")
+    put(ws, f"H{SM_IMPL_MULT}", f"={D}!$C${D_IMPL_MULT}", color=GREEN, fmt=FMT_MULT)
+    put(ws, f"G{SM_IMPL_G}", "Implied Perpetual Growth (exit)")
+    put(ws, f"I{SM_IMPL_G}", f"={D}!$D${D_IMPL_G}", color=GREEN, fmt=FMT_PCT)
+
+    # 2. Valuation range table
+    section(ws, SM_RANGE_HDR, "Valuation Range ($ per share)", last="E")
+    for col, text in zip("BCDE", ("Method", "Low", "Median", "High")):
+        c = put(ws, f"{col}{SM_RANGE_COLS}", text, bold=True, fill=HEADER_FILL)
+        c.alignment = Alignment(horizontal="left" if col == "B" else "right")
+    lo, hi = GRID_COLS[GRID_MID - 1], GRID_COLS[GRID_MID + 1]  # one grid step either side of the live case
+    rows = [("DCF - Perpetuity Growth", f"={SN}!${lo}${SN_PGM_FIRST + GRID_MID + 1}", f"={D}!$C${D_PRICE}",
+             f"={SN}!${hi}${SN_PGM_FIRST + GRID_MID - 1}"),
+            ("DCF - Exit Multiple", f"={SN}!${lo}${SN_EXIT_FIRST + GRID_MID + 1}", f"={D}!$D${D_PRICE}",
+             f"={SN}!${hi}${SN_EXIT_FIRST + GRID_MID - 1}")]
+    rows += [(f'="Comps - "&{CP}!$B${CP_OUT_FIRST + k}', f"={CP}!$D${CP_OUT_FIRST + k}",
+              f"={CP}!$E${CP_OUT_FIRST + k}", f"={CP}!$F${CP_OUT_FIRST + k}") for k in range(len(CP_MULTIPLES))]
+    for r, (label, low, med, high) in enumerate(rows, start=SM_RANGE_FIRST):
+        put(ws, f"B{r}", label, color=GREEN if label.startswith("=") else BLACK)
+        for col, f in zip("CDE", (low, med, high)):
+            put(ws, f"{col}{r}", f, color=GREEN, fmt=FMT_PRICE)
+    put(ws, f"B{SM_RANGE_PRICE}", "Current Share Price (reference)", italic=True)
+    put(ws, f"D{SM_RANGE_PRICE}", f"=$C${SM_PRICE}", fmt=FMT_PRICE, italic=True)
+    total_style(ws, SM_RANGE_PRICE, last="E")
+
+    # Chart helper (outside the print area): visible bar length = High - Low
+    put(ws, f"N{SM_RANGE_COLS}", "Chart helper: High - Low", bold=True)
+    for r in range(SM_RANGE_FIRST, SM_RANGE_LAST + 1):
+        put(ws, f"N{r}", f"=IFERROR(E{r}-C{r},0)", fmt=FMT_PRICE)
+
+    # 3. Football-field chart: invisible Low series stacked under a visible High - Low series
+    section(ws, SM_RANGE_HDR, "Football Field - Implied Share Price Range", first="G", last="L")
+    put(ws, f"G{SM_RANGE_COLS}", f'="Current share price: "&TEXT($C${SM_PRICE},"$#,##0.00")', bold=True)
+    chart = BarChart()
+    chart.type = "bar"
+    chart.grouping = "stacked"
+    chart.overlap = 100
+    chart.gapWidth = 60
+    chart.add_data(Reference(ws, min_col=3, min_row=SM_RANGE_FIRST, max_row=SM_RANGE_LAST))
+    chart.add_data(Reference(ws, min_col=14, min_row=SM_RANGE_FIRST, max_row=SM_RANGE_LAST))
+    chart.set_categories(Reference(ws, min_col=2, min_row=SM_RANGE_FIRST, max_row=SM_RANGE_LAST))
+    base, bar = chart.series
+    base.graphicalProperties.noFill = True
+    base.graphicalProperties.line.noFill = True
+    bar.graphicalProperties.solidFill = "1F3864"
+    bar.graphicalProperties.line.solidFill = "1F3864"
+    chart.legend = None
+    chart.x_axis.scaling.orientation = "maxMin"  # first method at the top
+    chart.x_axis.delete = False
+    chart.y_axis.delete = False
+    chart.y_axis.crosses = "max"
+    chart.y_axis.numFmt = "$#,##0"
+    chart.y_axis.title = "$ per share (low to high)"
+    chart.width, chart.height = 15.5, 10.5
+    ws.add_chart(chart, f"G{SM_RANGE_FIRST}")
+
+    # 5. Notes lines for manual entry
+    for hdr, first, title in ((SM_THESIS_HDR, SM_THESIS_FIRST, "Investment Thesis"),
+                              (SM_RISK_HDR, SM_RISK_FIRST, "Key Risks")):
+        section(ws, hdr, title, last="E")
+        for r in range(first, first + SM_NOTE_LINES):
+            ws.merge_cells(f"B{r}:E{r}")
+            put(ws, f"B{r}", None, color=BLUE)
+            for col in "BCDE":
+                ws[f"{col}{r}"].border = Border(bottom=Side(style="thin", color="808080"))
+            ws.row_dimensions[r].height = 20
+
+    ws.print_area = f"B1:L{SM_LAST_ROW}"
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 1
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.print_options.horizontalCentered = True
+
+
 def build_workbook(active, snapshot=None):
     wb = Workbook()
     build_assumptions(wb)
@@ -1161,6 +1301,7 @@ def build_workbook(active, snapshot=None):
     build_scenarios(wb, active, snapshot)
     build_sensitivity(wb)
     build_comps(wb)
+    build_summary(wb)
     return wb
 
 
