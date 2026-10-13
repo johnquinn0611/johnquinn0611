@@ -1,4 +1,4 @@
-"""Build the DCF valuation workbook (Assumptions, Segment_Revenue, Working_Capital, Capex tabs).
+"""Build the DCF valuation workbook (Assumptions, Segment_Revenue, Working_Capital, Capex, WACC, DCF tabs).
 
 Run:  python dcf_model/build_dcf_model.py   ->   dcf_model/DCF_Model.xlsx
 
@@ -30,6 +30,12 @@ FMT_YEAR = "0"
 FMT_DATE = "mmm d, yyyy"
 FMT_DAYS = '0.0_);(0.0);"-"_)'
 FMT_INTENSITY = '$0.00_);($0.00);"-"_)'
+FMT_MULT = '0.0"x"'
+FMT_PRICE = '$#,##0.00_);($#,##0.00);"-"_)'
+FMT_BETA = "0.00"
+FMT_FACTOR = "0.0000"
+FMT_PERIOD = "0.0"
+FMT_SHARES = "#,##0.0"
 
 N_SEGMENTS = 8
 YEAR_COLS = "CDEFGH"  # C = base year, D:H = projection years 1-5
@@ -52,6 +58,12 @@ EXAMPLE_BALANCES = (245.0, 180.0, 120.0)  # base-year AR, inventory, AP ($mm)
 EXAMPLE_MAINT_CAPEX = 0.03
 EXAMPLE_CAPEX_INTENSITY = [0.25, 0.15, 0.10]  # $ capex per $1 of incremental revenue
 
+# Example WACC / DCF inputs -- replace.
+EXAMPLE_RF, EXAMPLE_ERP, EXAMPLE_BETA, EXAMPLE_KD = 0.0425, 0.055, 1.10, 0.06
+EXAMPLE_MCAP, EXAMPLE_DEBT = 6000.0, 1000.0  # $mm
+EXAMPLE_DA_PCT, EXAMPLE_DCF_TGR, EXAMPLE_EXIT_MULT = 0.035, 0.025, 12.0
+EXAMPLE_NET_DEBT, EXAMPLE_SHARES, EXAMPLE_MIDYEAR = 800.0, 150.0, 1  # $mm, mm shares, 1 = mid-year
+
 # ---- Assumptions tab cell map --------------------------------------------
 A = "Assumptions"
 A_COMPANY, A_TICKER, A_UNITS, A_BASE_YEAR, A_VAL_DATE = 7, 8, 9, 10, 11
@@ -73,7 +85,13 @@ A_MAINT = A_CPX_HDR + 1
 A_INT_HDR = A_MAINT + 1
 A_INT_FIRST = A_INT_HDR + 1
 A_INT_LAST = A_INT_FIRST + N_SEGMENTS - 1
-A_DRV_NOTES = A_INT_LAST + 2
+A_DRV_NOTES = A_INT_LAST + 2  # driver notes occupy A_DRV_NOTES+1 .. A_DRV_NOTES+4
+
+# Sections 6-7 (WACC & DCF inputs), added below the Driver Notes block
+A_WACC_HDR = A_DRV_NOTES + 6
+A_RF, A_ERP, A_BETA, A_KD, A_MCAP, A_DEBT = range(A_WACC_HDR + 1, A_WACC_HDR + 7)
+A_DCF_HDR = A_DEBT + 2
+A_DA_PCT, A_DCF_TGR, A_EXIT_MULT, A_NET_DEBT, A_SHARES, A_MIDYEAR = range(A_DCF_HDR + 1, A_DCF_HDR + 7)
 
 # ---- Segment_Revenue tab row map ------------------------------------------
 S = "Segment_Revenue"
@@ -111,6 +129,29 @@ X_GC_FIRST = X_GC_HDR + 1
 X_GC_TOTAL = X_GC_FIRST + N_SEGMENTS
 X_SUM_HDR = X_GC_TOTAL + 2
 X_SUM_MAINT, X_SUM_GROWTH, X_SUM_TOTAL, X_SUM_PCT = range(X_SUM_HDR + 1, X_SUM_HDR + 5)
+
+# ---- WACC tab row map (label in B, value in C) ----------------------------
+K = "WACC"
+K_IN_HDR = 4
+K_RF, K_ERP, K_BETA, K_KD, K_TAX, K_MCAP, K_DEBT = range(K_IN_HDR + 1, K_IN_HDR + 8)
+K_COC_HDR = K_DEBT + 2
+K_KE, K_KD_AT = K_COC_HDR + 1, K_COC_HDR + 2
+K_CAP_HDR = K_KD_AT + 2
+K_CAP, K_WE, K_WD = range(K_CAP_HDR + 1, K_CAP_HDR + 4)
+K_WACC_HDR = K_WD + 2
+K_WACC = K_WACC_HDR + 1
+
+# ---- DCF tab row map (projections in D:H; valuation in C = perpetuity, D = exit multiple)
+D = "DCF"
+D_FCF_HDR = 7
+D_EBIT, D_TAX, D_DA, D_CAPEX, D_NWC, D_UFCF = range(D_FCF_HDR + 1, D_FCF_HDR + 7)
+D_DISC_HDR = D_UFCF + 2
+D_RATE, D_TOGGLE, D_PERIOD, D_FACTOR, D_PV, D_SUM_PV = range(D_DISC_HDR + 1, D_DISC_HDR + 7)
+D_VAL_HDR = D_SUM_PV + 2
+(D_METHOD, D_TV_FCF, D_TV_G, D_TV_EBITDA, D_TV_MULT, D_TV, D_TV_PERIOD, D_TV_FACTOR, D_TV_PV,
+ D_EV_PV_FCF, D_EV, D_NET_DEBT, D_EQUITY, D_SHARES, D_PRICE) = range(D_VAL_HDR + 1, D_VAL_HDR + 16)
+D_CHK_HDR = D_PRICE + 2
+D_TV_PCT, D_IMPL_MULT, D_IMPL_G = range(D_CHK_HDR + 1, D_CHK_HDR + 4)
 
 
 def put(ws, ref, value, color=BLACK, fmt=None, bold=False, italic=False, fill=None, size=10):
@@ -559,6 +600,167 @@ def build_capex(wb):
     add_name(wb, "Total_Capex", f"{X}!$C${X_SUM_TOTAL}:$H${X_SUM_TOTAL}")
 
 
+def add_wacc_dcf_inputs(wb):
+    """Sections 6-7 on Assumptions: new input cells, plus linking Discount Rate (C15) to the WACC tab."""
+    ws = wb[A]
+    note = "Example placeholder - replace"
+
+    section(ws, A_WACC_HDR, "6. WACC Inputs", last="I")
+    section(ws, A_DCF_HDR, "7. DCF Inputs", last="I")
+    rows = [
+        (A_RF, "Risk-Free Rate", EXAMPLE_RF, FMT_PCT),
+        (A_ERP, "Equity Risk Premium", EXAMPLE_ERP, FMT_PCT),
+        (A_BETA, "Levered Beta", EXAMPLE_BETA, FMT_BETA),
+        (A_KD, "Pre-Tax Cost of Debt", EXAMPLE_KD, FMT_PCT),
+        (A_MCAP, "Market Capitalization ($mm)", EXAMPLE_MCAP, FMT_USD),
+        (A_DEBT, "Total Debt ($mm)", EXAMPLE_DEBT, FMT_USD),
+        (A_DA_PCT, "D&A (% of Revenue)", EXAMPLE_DA_PCT, FMT_PCT),
+        (A_DCF_TGR, "Terminal Growth Rate", EXAMPLE_DCF_TGR, FMT_PCT),
+        (A_EXIT_MULT, "Exit EV/EBITDA Multiple", EXAMPLE_EXIT_MULT, FMT_MULT),
+        (A_NET_DEBT, "Net Debt ($mm)", EXAMPLE_NET_DEBT, FMT_USD),
+        (A_SHARES, "Diluted Shares Outstanding (mm)", EXAMPLE_SHARES, FMT_SHARES),
+        (A_MIDYEAR, "Mid-Year Convention (1 = mid-year, 0 = end-of-year)", EXAMPLE_MIDYEAR, "0"),
+    ]
+    for r, label, val, fmt in rows:
+        put(ws, f"B{r}", label)
+        put(ws, f"C{r}", val, color=BLUE, fmt=fmt, fill=INPUT_FILL)
+        put(ws, f"I{r}", note, italic=True)
+
+    # The model's discount rate now comes from the WACC tab
+    put(ws, f"C{A_WACC}", f"={K}!$C${K_WACC}", color=GREEN, fmt=FMT_PCT, fill=PatternFill(fill_type=None))
+
+
+def build_wacc(wb):
+    ws = wb.create_sheet(K)
+    ws.sheet_view.showGridLines = False
+    for col, width in zip("ABC", (2, 40, 14)):
+        ws.column_dimensions[col].width = width
+    put(ws, "B1", '=CompanyName&" - WACC Build"', bold=True, size=14)
+    put(ws, "B2", '="("&Units&"; inputs link to the Assumptions tab)"', italic=True)
+
+    section(ws, K_IN_HDR, "Inputs (linked from Assumptions)", last="C")
+    for r, label, a, fmt in ((K_RF, "Risk-Free Rate", A_RF, FMT_PCT),
+                             (K_ERP, "Equity Risk Premium", A_ERP, FMT_PCT),
+                             (K_BETA, "Levered Beta", A_BETA, FMT_BETA),
+                             (K_KD, "Pre-Tax Cost of Debt", A_KD, FMT_PCT),
+                             (K_TAX, "Tax Rate", A_TAX, FMT_PCT),
+                             (K_MCAP, "Market Capitalization ($mm)", A_MCAP, FMT_USD),
+                             (K_DEBT, "Total Debt ($mm)", A_DEBT, FMT_USD)):
+        put(ws, f"B{r}", label)
+        put(ws, f"C{r}", f"={A}!$C${a}", color=GREEN, fmt=fmt)
+
+    section(ws, K_COC_HDR, "Cost of Capital", last="C")
+    put(ws, f"B{K_KE}", "Cost of Equity (CAPM: Rf + Beta x ERP)")
+    put(ws, f"C{K_KE}", f"=C{K_RF}+C{K_BETA}*C{K_ERP}", fmt=FMT_PCT)
+    put(ws, f"B{K_KD_AT}", "After-Tax Cost of Debt (Kd x (1 - Tax))")
+    put(ws, f"C{K_KD_AT}", f"=C{K_KD}*(1-C{K_TAX})", fmt=FMT_PCT)
+
+    section(ws, K_CAP_HDR, "Capital Structure", last="C")
+    put(ws, f"B{K_CAP}", "Total Capitalization (Market Cap + Debt)")
+    put(ws, f"C{K_CAP}", f"=C{K_MCAP}+C{K_DEBT}", fmt=FMT_USD)
+    put(ws, f"B{K_WE}", "Equity Weight (E / (D + E))")
+    put(ws, f"C{K_WE}", f"=IF(C{K_CAP}=0,0,C{K_MCAP}/C{K_CAP})", fmt=FMT_PCT)
+    put(ws, f"B{K_WD}", "Debt Weight (D / (D + E))")
+    put(ws, f"C{K_WD}", f"=IF(C{K_CAP}=0,0,C{K_DEBT}/C{K_CAP})", fmt=FMT_PCT)
+
+    section(ws, K_WACC_HDR, "Weighted Average Cost of Capital", last="C")
+    put(ws, f"B{K_WACC}", "WACC (discount rate used by the model)")
+    put(ws, f"C{K_WACC}", f"=C{K_WE}*C{K_KE}+C{K_WD}*C{K_KD_AT}", fmt=FMT_PCT)
+    total_style(ws, K_WACC, last="C")
+
+
+def build_dcf(wb):
+    ws = timeseries_sheet(wb, D, "Discounted Cash Flow Valuation")
+
+    # Unlevered free cash flow -- deductions shown as negatives
+    section(ws, D_FCF_HDR, "Unlevered Free Cash Flow", last="H")
+    put(ws, f"B{D_EBIT}", "EBIT")
+    put(ws, f"B{D_TAX}", "Less: Taxes (EBIT x Tax Rate)")
+    put(ws, f"B{D_DA}", "Plus: D&A (Revenue x D&A %)")
+    put(ws, f"B{D_CAPEX}", "Less: Total Capex")
+    put(ws, f"B{D_NWC}", "Less: Change in NWC")
+    put(ws, f"B{D_UFCF}", "Unlevered Free Cash Flow")
+    for col in PROJ_COLS:
+        put(ws, f"{col}{D_EBIT}", f"={S}!{col}{S_SUM_EBIT}", color=GREEN, fmt=FMT_USD)
+        put(ws, f"{col}{D_TAX}", f"=-{col}{D_EBIT}*{A}!$C${A_TAX}", fmt=FMT_USD)
+        put(ws, f"{col}{D_DA}", f"={S}!{col}{S_SUM_REV}*{A}!$C${A_DA_PCT}", fmt=FMT_USD)
+        put(ws, f"{col}{D_CAPEX}", f"=-{X}!{col}{X_SUM_TOTAL}", color=GREEN, fmt=FMT_USD)
+        put(ws, f"{col}{D_NWC}", f"=-{W}!{col}{W_CHG}", color=GREEN, fmt=FMT_USD)
+        put(ws, f"{col}{D_UFCF}", f"=SUM({col}{D_EBIT}:{col}{D_NWC})", fmt=FMT_USD)
+    total_style(ws, D_UFCF)
+
+    # Discounting
+    section(ws, D_DISC_HDR, "Discounting", last="H")
+    put(ws, f"B{D_RATE}", "Discount Rate (WACC)")
+    put(ws, f"C{D_RATE}", f"={A}!$C${A_WACC}", color=GREEN, fmt=FMT_PCT)
+    put(ws, f"B{D_TOGGLE}", "Mid-Year Convention (1 = mid-year, 0 = end-of-year)")
+    put(ws, f"C{D_TOGGLE}", f"={A}!$C${A_MIDYEAR}", color=GREEN, fmt="0")
+    put(ws, f"B{D_PERIOD}", "Discount Period (t - 0.5 x toggle)")
+    put(ws, f"B{D_FACTOR}", "Discount Factor (1 / (1 + WACC)^period)")
+    put(ws, f"B{D_PV}", "PV of Unlevered FCF")
+    for col in PROJ_COLS:
+        put(ws, f"{col}{D_PERIOD}", f"={col}${S_T}-0.5*$C${D_TOGGLE}", fmt=FMT_PERIOD)
+        put(ws, f"{col}{D_FACTOR}", f"=1/(1+$C${D_RATE})^{col}{D_PERIOD}", fmt=FMT_FACTOR)
+        put(ws, f"{col}{D_PV}", f"={col}{D_UFCF}*{col}{D_FACTOR}", fmt=FMT_USD)
+    put(ws, f"B{D_SUM_PV}", "Sum of PV of Unlevered FCF")
+    put(ws, f"C{D_SUM_PV}", f"=SUM(D{D_PV}:H{D_PV})", fmt=FMT_USD)
+    total_style(ws, D_SUM_PV, last="C")
+
+    # Terminal value & valuation: C = perpetuity growth method, D = exit multiple method
+    section(ws, D_VAL_HDR, "Terminal Value & Valuation", last="H")
+    for col, text in (("C", "Perpetuity Growth"), ("D", "Exit Multiple")):
+        c = put(ws, f"{col}{D_METHOD}", text, bold=True, fill=HEADER_FILL)
+        c.alignment = Alignment(wrap_text=True, horizontal="center", vertical="center")
+    ws[f"B{D_METHOD}"].fill = HEADER_FILL
+    ws.row_dimensions[D_METHOD].height = 28
+    rate, last = f"$C${D_RATE}", PROJ_COLS[-1]
+
+    put(ws, f"B{D_TV_FCF}", "Terminal-Year Unlevered FCF")
+    put(ws, f"C{D_TV_FCF}", f"={last}{D_UFCF}", fmt=FMT_USD)
+    put(ws, f"B{D_TV_G}", "Terminal Growth Rate")
+    put(ws, f"C{D_TV_G}", f"={A}!$C${A_DCF_TGR}", color=GREEN, fmt=FMT_PCT)
+    put(ws, f"B{D_TV_EBITDA}", "Terminal-Year EBITDA (EBIT + D&A)")
+    put(ws, f"D{D_TV_EBITDA}", f"={last}{D_EBIT}+{last}{D_DA}", fmt=FMT_USD)
+    put(ws, f"B{D_TV_MULT}", "Exit EV/EBITDA Multiple")
+    put(ws, f"D{D_TV_MULT}", f"={A}!$C${A_EXIT_MULT}", color=GREEN, fmt=FMT_MULT)
+    put(ws, f"B{D_TV}", "Terminal Value")
+    put(ws, f"C{D_TV}", f"=IF({rate}<=C{D_TV_G},0,C{D_TV_FCF}*(1+C{D_TV_G})/({rate}-C{D_TV_G}))", fmt=FMT_USD)
+    put(ws, f"D{D_TV}", f"=D{D_TV_EBITDA}*D{D_TV_MULT}", fmt=FMT_USD)
+
+    put(ws, f"B{D_TV_PERIOD}", "Terminal Discount Period (end of final year)")
+    put(ws, f"B{D_TV_FACTOR}", "Terminal Discount Factor")
+    put(ws, f"B{D_TV_PV}", "PV of Terminal Value")
+    put(ws, f"B{D_EV_PV_FCF}", "Plus: Sum of PV of Unlevered FCF")
+    put(ws, f"B{D_EV}", "Enterprise Value")
+    put(ws, f"B{D_NET_DEBT}", "Less: Net Debt")
+    put(ws, f"B{D_EQUITY}", "Equity Value")
+    put(ws, f"B{D_SHARES}", "Diluted Shares Outstanding (mm)")
+    put(ws, f"B{D_PRICE}", "Implied Share Price ($ per share) - OUTPUT")
+    for col in "CD":
+        put(ws, f"{col}{D_TV_PERIOD}", f"=${last}${S_T}", fmt=FMT_PERIOD)
+        put(ws, f"{col}{D_TV_FACTOR}", f"=1/(1+{rate})^{col}{D_TV_PERIOD}", fmt=FMT_FACTOR)
+        put(ws, f"{col}{D_TV_PV}", f"={col}{D_TV}*{col}{D_TV_FACTOR}", fmt=FMT_USD)
+        put(ws, f"{col}{D_EV_PV_FCF}", f"=$C${D_SUM_PV}", fmt=FMT_USD)
+        put(ws, f"{col}{D_EV}", f"={col}{D_TV_PV}+{col}{D_EV_PV_FCF}", fmt=FMT_USD)
+        put(ws, f"{col}{D_NET_DEBT}", f"=-{A}!$C${A_NET_DEBT}", color=GREEN, fmt=FMT_USD)
+        put(ws, f"{col}{D_EQUITY}", f"={col}{D_EV}+{col}{D_NET_DEBT}", fmt=FMT_USD)
+        put(ws, f"{col}{D_SHARES}", f"={A}!$C${A_SHARES}", color=GREEN, fmt=FMT_SHARES)
+        put(ws, f"{col}{D_PRICE}", f"=IF({col}{D_SHARES}=0,0,{col}{D_EQUITY}/{col}{D_SHARES})", fmt=FMT_PRICE)
+    for r in (D_EV, D_EQUITY, D_PRICE):
+        total_style(ws, r, last="D")
+
+    # Cross-checks
+    section(ws, D_CHK_HDR, "Cross-Checks", last="H")
+    put(ws, f"B{D_TV_PCT}", "PV of Terminal Value (% of Enterprise Value)")
+    for col in "CD":
+        put(ws, f"{col}{D_TV_PCT}", f"=IF({col}{D_EV}=0,0,{col}{D_TV_PV}/{col}{D_EV})", fmt=FMT_PCT)
+    put(ws, f"B{D_IMPL_MULT}", "Implied Exit EV/EBITDA (from perpetuity method)")
+    put(ws, f"C{D_IMPL_MULT}", f"=IF(D{D_TV_EBITDA}=0,0,C{D_TV}/D{D_TV_EBITDA})", fmt=FMT_MULT)
+    put(ws, f"B{D_IMPL_G}", "Implied Perpetual Growth (from exit multiple method)")
+    put(ws, f"D{D_IMPL_G}",
+        f"=IF(D{D_TV}+C{D_TV_FCF}=0,0,(D{D_TV}*{rate}-C{D_TV_FCF})/(D{D_TV}+C{D_TV_FCF}))", fmt=FMT_PCT)
+
+
 def main():
     wb = Workbook()
     build_assumptions(wb)
@@ -566,6 +768,9 @@ def main():
     add_driver_inputs(wb)
     build_working_capital(wb)
     build_capex(wb)
+    add_wacc_dcf_inputs(wb)
+    build_wacc(wb)
+    build_dcf(wb)
     wb.save(OUT)
     print(f"Saved {OUT}")
 
