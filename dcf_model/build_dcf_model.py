@@ -1,5 +1,5 @@
 """Build the DCF valuation workbook (Assumptions, Segment_Revenue, Working_Capital, Capex, WACC, DCF,
-Scenarios, Sensitivity tabs).
+Scenarios, Sensitivity, Comps tabs).
 
 Run:  python dcf_model/build_dcf_model.py   ->   dcf_model/DCF_Model.xlsx
 Requires LibreOffice (soffice) on PATH: the workbook is recalculated headless once per scenario to
@@ -80,6 +80,19 @@ SCENARIO_SHIFTS = {  # driver: (bear shift, bull shift)
     "maint": (0.005, -0.005), "beta": (0.10, -0.10), "tgr": (-0.005, 0.005), "exit": (-2.0, 2.0),
 }
 SENS_STEPS = (0.005, 0.005, 1.0)  # WACC, terminal growth, exit multiple
+
+# Example peer data -- placeholders, replace with real comps.
+# name, ticker, price, diluted shares (mm), net debt ($mm), LTM/NTM revenue, LTM/NTM EBITDA,
+# LTM/NTM EBIT ($mm), LTM/NTM EPS ($)
+EXAMPLE_PEERS = [
+    ("Peer Company 1", "PEER1", 52.00, 120.0, 600.0, 1800, 1930, 560, 610, 430, 470, 2.40, 2.65),
+    ("Peer Company 2", "PEER2", 88.50, 85.0, 1200.0, 3100, 3300, 900, 980, 700, 765, 5.10, 5.60),
+    ("Peer Company 3", "PEER3", 34.25, 210.0, 300.0, 2500, 2700, 650, 720, 480, 540, 1.55, 1.75),
+    ("Peer Company 4", "PEER4", 120.00, 60.0, -250.0, 1500, 1650, 520, 575, 410, 455, 5.20, 5.80),
+    ("Peer Company 5", "PEER5", 45.75, 150.0, 900.0, 2200, 2330, 600, 640, 450, 485, 2.05, 2.25),
+    ("Peer Company 6", "PEER6", 18.40, 400.0, 2500.0, 4200, 4350, 700, 760, 380, 420, 0.55, 0.68),
+]
+N_PEERS = 8
 
 # ---- Assumptions tab cell map --------------------------------------------
 A = "Assumptions"
@@ -202,6 +215,42 @@ SN_EXIT_AXIS = SN_EXIT_HDR + 1
 SN_EXIT_FIRST = SN_EXIT_AXIS + 1
 GRID_COLS = "CDEFG"
 GRID_MID = 2  # index of the center (live case) row / column
+
+# ---- Comps tab layout ------------------------------------------------------
+CP = "Comps"
+# Peer input columns: B name, C ticker, D price, E shares, F market cap, G net debt, H EV,
+# I:P LTM/NTM revenue, EBITDA, EBIT, EPS, Q source / as-of date
+CP_METRIC_COLS = "IJKLMNOP"
+# Multiples (E:L on the multiples, statistics and helper blocks), in the same order as CP_METRIC_COLS
+CP_MULT_COLS = "EFGHIJKL"
+CP_MULTIPLES = [f"{m} - {p}" for m in ("EV/Revenue", "EV/EBITDA", "EV/EBIT", "P/E") for p in ("LTM", "NTM")]
+CP_IN_HDR = 4
+CP_IN_COLS = CP_IN_HDR + 1
+CP_IN_FIRST = CP_IN_COLS + 1
+CP_MULT_HDR = CP_IN_FIRST + N_PEERS + 1
+CP_MULT_COLS_ROW = CP_MULT_HDR + 1
+CP_MULT_FIRST = CP_MULT_COLS_ROW + 1
+CP_STAT_HDR = CP_MULT_FIRST + N_PEERS + 1
+CP_STAT_COLS_ROW = CP_STAT_HDR + 1
+CP_MEAN, CP_MEDIAN, CP_HIGH, CP_LOW, CP_P25, CP_P75 = range(CP_STAT_COLS_ROW + 1, CP_STAT_COLS_ROW + 7)
+CP_USED_HDR = CP_P75 + 2
+CP_USED_COLS_ROW = CP_USED_HDR + 1
+CP_USED_FIRST = CP_USED_COLS_ROW + 1
+CP_TGT_HDR = CP_USED_FIRST + N_PEERS + 1
+CP_TGT_COLS_ROW = CP_TGT_HDR + 1
+CP_TGT_REV, CP_TGT_EBITDA, CP_TGT_EBIT, CP_TGT_EPS = range(CP_TGT_COLS_ROW + 1, CP_TGT_COLS_ROW + 5)
+CP_IMP_HDR = CP_TGT_EPS + 2
+CP_APPLY_COLS_ROW = CP_IMP_HDR + 1
+CP_APPLY_FIRST = CP_APPLY_COLS_ROW + 1
+CP_EV_COLS_ROW = CP_APPLY_FIRST + len(CP_MULTIPLES) + 1
+CP_EV_FIRST = CP_EV_COLS_ROW + 1
+CP_EQ_COLS_ROW = CP_EV_FIRST + 6 + 1
+CP_EQ_FIRST = CP_EQ_COLS_ROW + 1
+CP_OUT_HDR = CP_EQ_FIRST + 6 + 1
+CP_OUT_COLS_ROW = CP_OUT_HDR + 1
+CP_OUT_FIRST = CP_OUT_COLS_ROW + 1
+CP_OUT_DCF_PGM = CP_OUT_FIRST + len(CP_MULTIPLES)
+CP_OUT_DCF_EXIT = CP_OUT_DCF_PGM + 1
 
 
 def put(ws, ref, value, color=BLACK, fmt=None, bold=False, italic=False, fill=None, size=10):
@@ -946,6 +995,159 @@ def build_sensitivity(wb):
             fill=CENTER_FILL)
 
 
+def build_comps(wb):
+    ws = wb.create_sheet(CP)
+    ws.sheet_view.showGridLines = False
+    ws.column_dimensions["A"].width = 2
+    ws.column_dimensions["B"].width = 44
+    for col in "CDEFGHIJKLMNOP":
+        ws.column_dimensions[col].width = 12
+    ws.column_dimensions["Q"].width = 40
+    put(ws, "B1", '=CompanyName&" - Comparable Companies Analysis"', bold=True, size=14)
+    put(ws, "B2", '="("&Units&" except per-share data; peer data is hand-entered in blue)"', italic=True)
+
+    def header_row(row, labels, first="B"):
+        for k, text in enumerate(labels):
+            if text is None:
+                continue
+            col = chr(ord(first) + k)
+            c = put(ws, f"{col}{row}", text, bold=True, fill=HEADER_FILL)
+            c.alignment = Alignment(wrap_text=True, horizontal="left" if col in "BQ" else "center",
+                                    vertical="center")
+        ws.row_dimensions[row].height = 30
+
+    mult_headers = ["Company", "Ticker", "Include (1/0)"] + CP_MULTIPLES
+
+    # 1. Peer inputs
+    section(ws, CP_IN_HDR, "Peer Inputs", last="Q")
+    header_row(CP_IN_COLS, ["Company", "Ticker", "Share Price ($)", "Diluted Shares (mm)", "Market Cap ($mm)",
+                            "Net Debt ($mm)", "Enterprise Value ($mm)", "LTM Revenue", "NTM Revenue",
+                            "LTM EBITDA", "NTM EBITDA", "LTM EBIT", "NTM EBIT", "LTM EPS ($)", "NTM EPS ($)",
+                            "Source / As-of Date"])
+    for i in range(N_PEERS):
+        r = CP_IN_FIRST + i
+        peer = EXAMPLE_PEERS[i] if i < len(EXAMPLE_PEERS) else (None,) * 13
+        name, ticker, price, shares, net_debt, *metrics = peer
+        for col, val, fmt in (("B", name, None), ("C", ticker, None), ("D", price, FMT_PRICE),
+                              ("E", shares, FMT_SHARES), ("G", net_debt, FMT_USD)):
+            put(ws, f"{col}{r}", val, color=BLUE, fmt=fmt, fill=INPUT_FILL)
+        for col, val in zip(CP_METRIC_COLS, metrics):
+            put(ws, f"{col}{r}", val, color=BLUE, fmt=FMT_PRICE if col in "OP" else FMT_USD, fill=INPUT_FILL)
+        put(ws, f"Q{r}", "Placeholder - replace (source, as-of date)" if name else None, color=BLUE,
+            fill=INPUT_FILL)
+        put(ws, f"F{r}", f'=IF(AND(ISNUMBER(D{r}),ISNUMBER(E{r})),D{r}*E{r},"")', fmt=FMT_USD)
+        put(ws, f"H{r}", f'=IF(AND(ISNUMBER(F{r}),ISNUMBER(G{r})),F{r}+G{r},"")', fmt=FMT_USD)
+
+    # 2. Peer multiples (IFERROR -> blank when data is missing)
+    section(ws, CP_MULT_HDR, "Peer Multiples", last="L")
+    header_row(CP_MULT_COLS_ROW, mult_headers)
+    for i in range(N_PEERS):
+        r, src = CP_MULT_FIRST + i, CP_IN_FIRST + i
+        put(ws, f"B{r}", f'=IF(B{src}="","",B{src})')
+        put(ws, f"C{r}", f'=IF(C{src}="","",C{src})')
+        put(ws, f"D{r}", 1, color=BLUE, fmt="0", fill=INPUT_FILL)
+        for k, (mcol, icol) in enumerate(zip(CP_MULT_COLS, CP_METRIC_COLS)):
+            if k < 6:
+                f = f'=IFERROR($H{src}/{icol}{src},"")'
+            else:
+                f = f'=IFERROR(IF(ISNUMBER($D{src}),$D{src}/{icol}{src},""),"")'
+            put(ws, f"{mcol}{r}", f, fmt=FMT_MULT)
+
+    # 3. Statistics over included peers (read from the helper block below)
+    section(ws, CP_STAT_HDR, "Statistics (included peers only)", last="L")
+    header_row(CP_STAT_COLS_ROW, ["Statistic", None, None] + CP_MULTIPLES)
+    first, last = CP_USED_FIRST, CP_USED_FIRST + N_PEERS - 1
+    for r, label, fn in ((CP_MEAN, "Mean", "AVERAGE({rng})"), (CP_MEDIAN, "Median", "MEDIAN({rng})"),
+                         (CP_HIGH, "High", "MAX({rng})"), (CP_LOW, "Low", "MIN({rng})"),
+                         (CP_P25, "25th Percentile", "PERCENTILE({rng},0.25)"),
+                         (CP_P75, "75th Percentile", "PERCENTILE({rng},0.75)")):
+        put(ws, f"B{r}", label)
+        for mcol in CP_MULT_COLS:
+            rng = f"{mcol}${first}:{mcol}${last}"
+            put(ws, f"{mcol}{r}", f'=IF(COUNT({rng})=0,"",{fn.format(rng=rng)})', fmt=FMT_MULT)
+
+    # Helper block: the multiple if Include = 1, else blank
+    section(ws, CP_USED_HDR, "Multiples Used in Statistics (multiple if Include = 1, else blank)", last="L")
+    header_row(CP_USED_COLS_ROW, mult_headers)
+    for i in range(N_PEERS):
+        r, m = CP_USED_FIRST + i, CP_MULT_FIRST + i
+        put(ws, f"B{r}", f"=B{m}")
+        put(ws, f"C{r}", f"=C{m}")
+        put(ws, f"D{r}", f"=D{m}", fmt="0")
+        for mcol in CP_MULT_COLS:
+            put(ws, f"{mcol}{r}", f'=IF(AND($D{m}=1,ISNUMBER({mcol}{m})),{mcol}{m},"")', fmt=FMT_MULT)
+
+    # 4. Target metrics, linked from the model (LTM = base year, NTM = first projection year)
+    section(ws, CP_TGT_HDR, "Target Metrics (linked from model; LTM = base year, NTM = first projection year)",
+            last="L")
+    header_row(CP_TGT_COLS_ROW, ["Metric"])
+    for col, src_col in (("C", "C"), ("D", "D")):
+        c = put(ws, f"{col}{CP_TGT_COLS_ROW}", f'="{"LTM" if col == "C" else "NTM"} ("&{S}!{src_col}${S_FY}&")"',
+                color=GREEN, bold=True, fill=HEADER_FILL)
+        c.alignment = Alignment(horizontal="center", vertical="center")
+    put(ws, f"B{CP_TGT_REV}", "Revenue ($mm)")
+    put(ws, f"C{CP_TGT_REV}", f"={S}!C{S_SUM_REV}", color=GREEN, fmt=FMT_USD)
+    put(ws, f"D{CP_TGT_REV}", f"={S}!D{S_SUM_REV}", color=GREEN, fmt=FMT_USD)
+    put(ws, f"B{CP_TGT_EBITDA}", "EBITDA ($mm) (EBIT + D&A)")
+    put(ws, f"C{CP_TGT_EBITDA}", f"={S}!C{S_SUM_EBIT}+{S}!C{S_SUM_REV}*{A}!$C${A_DA_PCT}", fmt=FMT_USD)
+    put(ws, f"D{CP_TGT_EBITDA}", f"={D}!D{D_EBIT}+{D}!D{D_DA}", fmt=FMT_USD)
+    put(ws, f"B{CP_TGT_EBIT}", "EBIT ($mm)")
+    put(ws, f"C{CP_TGT_EBIT}", f"={S}!C{S_SUM_EBIT}", color=GREEN, fmt=FMT_USD)
+    put(ws, f"D{CP_TGT_EBIT}", f"={S}!D{S_SUM_EBIT}", color=GREEN, fmt=FMT_USD)
+    put(ws, f"B{CP_TGT_EPS}", "EPS ($) ((EBIT - Total Debt x Kd) x (1 - Tax) / Shares)")
+    for col in "CD":
+        put(ws, f"{col}{CP_TGT_EPS}",
+            f'=IF({D}!$C${D_SHARES}=0,"",({col}{CP_TGT_EBIT}-{A}!$C${A_DEBT}*{A}!$C${A_KD})'
+            f'*(1-{A}!$C${A_TAX})/{D}!$C${D_SHARES})', fmt=FMT_PRICE)
+
+    # 5. Implied valuation
+    section(ws, CP_IMP_HDR, "Implied Valuation", last="L")
+    pct_cols = (("D", CP_P25), ("E", CP_MEDIAN), ("F", CP_P75))
+    header_row(CP_APPLY_COLS_ROW, ["Multiples Applied", "Target Metric", "25th Percentile", "Median",
+                                   "75th Percentile"])
+    header_row(CP_EV_COLS_ROW, ["Implied Enterprise Value ($mm)", None, "25th Percentile", "Median",
+                                "75th Percentile"])
+    header_row(CP_EQ_COLS_ROW, ["Implied Equity Value ($mm) (EV less Net Debt from DCF tab)", None,
+                                "25th Percentile", "Median", "75th Percentile"])
+    for k, (label, mcol) in enumerate(zip(CP_MULTIPLES, CP_MULT_COLS)):
+        r = CP_APPLY_FIRST + k
+        tgt = f"{'CD'[k % 2]}{(CP_TGT_REV, CP_TGT_EBITDA, CP_TGT_EBIT, CP_TGT_EPS)[k // 2]}"
+        put(ws, f"B{r}", label)
+        put(ws, f"C{r}", f"={tgt}", fmt=FMT_PRICE if k >= 6 else FMT_USD)
+        for col, stat in pct_cols:
+            put(ws, f"{col}{r}", f"={mcol}{stat}", fmt=FMT_MULT)
+        if k < 6:
+            ev, eq = CP_EV_FIRST + k, CP_EQ_FIRST + k
+            put(ws, f"B{ev}", label)
+            put(ws, f"B{eq}", label)
+            for col, _ in pct_cols:
+                put(ws, f"{col}{ev}", f'=IFERROR($C{r}*{col}{r},"")', fmt=FMT_USD)
+                put(ws, f"{col}{eq}", f'=IFERROR({col}{ev}+{D}!$C${D_NET_DEBT},"")', fmt=FMT_USD)
+
+    # Output block: implied share price per multiple, plus the live DCF prices for comparison
+    section(ws, CP_OUT_HDR, "Implied Share Price ($ per share) - OUTPUT", last="L")
+    header_row(CP_OUT_COLS_ROW, ["Method", None, "Low (25th Pct)", "Median", "High (75th Pct)"])
+    for k, label in enumerate(CP_MULTIPLES):
+        r = CP_OUT_FIRST + k
+        put(ws, f"B{r}", label)
+        for col, _ in pct_cols:
+            if k < 6:
+                f = f'=IFERROR({col}{CP_EQ_FIRST + k}/{D}!$C${D_SHARES},"")'
+            else:
+                f = f'=IFERROR($C{CP_APPLY_FIRST + k}*{col}{CP_APPLY_FIRST + k},"")'
+            put(ws, f"{col}{r}", f, fmt=FMT_PRICE)
+    put(ws, f"B{CP_OUT_DCF_PGM}", "DCF - Perpetuity Growth (current)")
+    put(ws, f"E{CP_OUT_DCF_PGM}", f"={D}!$C${D_PRICE}", color=GREEN, fmt=FMT_PRICE)
+    put(ws, f"B{CP_OUT_DCF_EXIT}", "DCF - Exit Multiple (current)")
+    put(ws, f"E{CP_OUT_DCF_EXIT}", f"={D}!$D${D_PRICE}", color=GREEN, fmt=FMT_PRICE)
+    total_style(ws, CP_OUT_DCF_PGM, last="F")
+
+    ws.freeze_panes = "C4"
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.fitToWidth = 1
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+
+
 def build_workbook(active, snapshot=None):
     wb = Workbook()
     build_assumptions(wb)
@@ -958,6 +1160,7 @@ def build_workbook(active, snapshot=None):
     build_dcf(wb)
     build_scenarios(wb, active, snapshot)
     build_sensitivity(wb)
+    build_comps(wb)
     return wb
 
 
