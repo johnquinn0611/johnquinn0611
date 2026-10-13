@@ -1,16 +1,23 @@
-"""Build the DCF valuation workbook (Assumptions, Segment_Revenue, Working_Capital, Capex, WACC, DCF tabs).
+"""Build the DCF valuation workbook (Assumptions, Segment_Revenue, Working_Capital, Capex, WACC, DCF,
+Scenarios, Sensitivity tabs).
 
 Run:  python dcf_model/build_dcf_model.py   ->   dcf_model/DCF_Model.xlsx
+Requires LibreOffice (soffice) on PATH: the workbook is recalculated headless once per scenario to
+fill the static Scenario Summary table, and once more for the final file.
 
 Layout conventions shared by every time-series tab (keep new tabs on these):
   * Column B = row labels
   * Column C = base year (last actual fiscal year, period t = 0)
   * Columns D:H = projection years 1-5 (periods t = 1..5)
 """
+import shutil
+import subprocess
+import sys
+import tempfile
 from datetime import date
 from pathlib import Path
 
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.workbook.defined_name import DefinedName
 from openpyxl.worksheet.datavalidation import DataValidation
@@ -23,6 +30,7 @@ INPUT_FILL = PatternFill("solid", fgColor="FFFF00")
 SECTION_FILL = PatternFill("solid", fgColor="1F3864")
 HEADER_FILL = PatternFill("solid", fgColor="D9E1F2")
 TOP_BORDER = Border(top=Side(style="thin", color="000000"))
+CENTER_FILL = PatternFill("solid", fgColor="FCE4D6")
 
 FMT_USD = '$#,##0.0_);($#,##0.0);"-"_)'
 FMT_PCT = '0.0%_);(0.0%);"-"_)'
@@ -63,6 +71,15 @@ EXAMPLE_RF, EXAMPLE_ERP, EXAMPLE_BETA, EXAMPLE_KD = 0.0425, 0.055, 1.10, 0.06
 EXAMPLE_MCAP, EXAMPLE_DEBT = 6000.0, 1000.0  # $mm
 EXAMPLE_DA_PCT, EXAMPLE_DCF_TGR, EXAMPLE_EXIT_MULT = 0.035, 0.025, 12.0
 EXAMPLE_NET_DEBT, EXAMPLE_SHARES, EXAMPLE_MIDYEAR = 800.0, 150.0, 1  # $mm, mm shares, 1 = mid-year
+
+# Scenarios: Base = the example inputs above; Bear / Bull = Base shifted by these placeholder amounts.
+SCENARIOS = ("Bear", "Base", "Bull")
+SCENARIO_SHIFTS = {  # driver: (bear shift, bull shift)
+    "growth": (-0.02, 0.02), "margin": (-0.02, 0.02),
+    "dso": (5, -5), "dio": (5, -5), "dpo": (-5, 5),
+    "maint": (0.005, -0.005), "beta": (0.10, -0.10), "tgr": (-0.005, 0.005), "exit": (-2.0, 2.0),
+}
+SENS_STEPS = (0.005, 0.005, 1.0)  # WACC, terminal growth, exit multiple
 
 # ---- Assumptions tab cell map --------------------------------------------
 A = "Assumptions"
@@ -152,6 +169,39 @@ D_VAL_HDR = D_SUM_PV + 2
  D_EV_PV_FCF, D_EV, D_NET_DEBT, D_EQUITY, D_SHARES, D_PRICE) = range(D_VAL_HDR + 1, D_VAL_HDR + 16)
 D_CHK_HDR = D_PRICE + 2
 D_TV_PCT, D_IMPL_MULT, D_IMPL_G = range(D_CHK_HDR + 1, D_CHK_HDR + 4)
+
+# ---- Scenario selector on Assumptions (empty row 3) -------------------------
+A_SCEN = 3  # B = label, C = Bear/Base/Bull dropdown, D = label, E = 1/2/3 helper
+
+# ---- Scenarios tab row map (C = Bear, D = Base, E = Bull, F = Live) ---------
+SC = "Scenarios"
+SC_HDR = 4
+SC_GROWTH_HDR = SC_HDR + 2
+SC_GROWTH_FIRST = SC_GROWTH_HDR + 1
+SC_MARGIN_HDR = SC_GROWTH_FIRST + N_SEGMENTS + 1
+SC_MARGIN_FIRST = SC_MARGIN_HDR + 1
+SC_DAYS_HDR = SC_MARGIN_FIRST + N_SEGMENTS + 1
+SC_DSO_FIRST = SC_DAYS_HDR + 1
+SC_DIO_FIRST = SC_DSO_FIRST + len(PROJ_COLS)
+SC_DPO_FIRST = SC_DIO_FIRST + len(PROJ_COLS)
+SC_OTHER_HDR = SC_DPO_FIRST + len(PROJ_COLS) + 1
+SC_MAINT, SC_BETA, SC_TGR, SC_EXIT = range(SC_OTHER_HDR + 1, SC_OTHER_HDR + 5)
+SC_SUM_HDR = SC_EXIT + 2
+SC_SUM_COLS = SC_SUM_HDR + 1
+SC_EV_PGM, SC_EV_EXIT, SC_PX_PGM, SC_PX_EXIT = range(SC_SUM_COLS + 1, SC_SUM_COLS + 5)
+
+# ---- Sensitivity tab row map (5 x 5 grids in C:G, WACC axis in B) -----------
+SN = "Sensitivity"
+SN_STEP_HDR = 4
+SN_STEP_WACC, SN_STEP_TGR, SN_STEP_MULT = range(SN_STEP_HDR + 1, SN_STEP_HDR + 4)
+SN_PGM_HDR = SN_STEP_MULT + 2
+SN_PGM_AXIS = SN_PGM_HDR + 1
+SN_PGM_FIRST = SN_PGM_AXIS + 1
+SN_EXIT_HDR = SN_PGM_FIRST + 6
+SN_EXIT_AXIS = SN_EXIT_HDR + 1
+SN_EXIT_FIRST = SN_EXIT_AXIS + 1
+GRID_COLS = "CDEFG"
+GRID_MID = 2  # index of the center (live case) row / column
 
 
 def put(ws, ref, value, color=BLACK, fmt=None, bold=False, italic=False, fill=None, size=10):
@@ -761,7 +811,142 @@ def build_dcf(wb):
         f"=IF(D{D_TV}+C{D_TV_FCF}=0,0,(D{D_TV}*{rate}-C{D_TV_FCF})/(D{D_TV}+C{D_TV_FCF}))", fmt=FMT_PCT)
 
 
-def main():
+def build_scenarios(wb, active, snapshot):
+    """Scenarios tab, the selector on Assumptions row 3, and repointing the Assumptions drivers to Live."""
+    a = wb[A]
+    put(a, f"B{A_SCEN}", "Active Scenario (Bear / Base / Bull)", bold=True)
+    put(a, f"C{A_SCEN}", active, color=BLUE, fill=INPUT_FILL)
+    dv = DataValidation(type="list", formula1='"' + ",".join(SCENARIOS) + '"', allow_blank=False,
+                        showErrorMessage=True, errorTitle="Invalid scenario", error="Choose Bear, Base or Bull.")
+    a.add_data_validation(dv)
+    dv.add(f"C{A_SCEN}")
+    put(a, f"D{A_SCEN}", "Scenario # (1/2/3)")
+    put(a, f"E{A_SCEN}", f"=MATCH($C${A_SCEN},{SC}!$C${SC_HDR}:$E${SC_HDR},0)")
+    case = f"{A}!$E${A_SCEN}"
+
+    ws = wb.create_sheet(SC)
+    ws.sheet_view.showGridLines = False
+    for col, width in zip("ABCDEF", (2, 40, 12, 12, 12, 12)):
+        ws.column_dimensions[col].width = width
+    put(ws, "B1", '=CompanyName&" - Scenarios"', bold=True, size=14)
+    put(ws, "B2", f'="(Edit Bear / Base / Bull inputs; Live = active case: "&{A}!$C${A_SCEN}&")"', italic=True)
+    for col, text in zip("BCDEF", ("Driver",) + SCENARIOS + ("Live",)):
+        c = put(ws, f"{col}{SC_HDR}", text, bold=True, fill=HEADER_FILL)
+        c.alignment = Alignment(horizontal="left" if col == "B" else "right")
+    ws.freeze_panes = f"C{SC_HDR + 1}"
+
+    def driver_row(r, label, base, shift, fmt, label_color=BLACK):
+        put(ws, f"B{r}", label, color=label_color)
+        bear, bull = SCENARIO_SHIFTS[shift]
+        vals = (None, None, None) if base is None else (round(base + bear, 6), base, round(base + bull, 6))
+        for col, v in zip("CDE", vals):
+            put(ws, f"{col}{r}", v, color=BLUE, fmt=fmt, fill=INPUT_FILL)
+        put(ws, f"F{r}", f"=CHOOSE({case},C{r},D{r},E{r})", fmt=fmt, bold=True)
+
+    def repoint(ref, sc_row, fmt):
+        put(a, ref, f"={SC}!$F${sc_row}", color=GREEN, fmt=fmt, fill=PatternFill(fill_type=None))
+
+    section(ws, SC_GROWTH_HDR, "Segment Growth Rate (% / yr)")
+    section(ws, SC_MARGIN_HDR, "Segment Operating Margin (%)")
+    for i in range(N_SEGMENTS):
+        seg = EXAMPLE_SEGMENTS[i] if i < len(EXAMPLE_SEGMENTS) else (None,) * 4
+        g, m, ar = SC_GROWTH_FIRST + i, SC_MARGIN_FIRST + i, A_SEG_FIRST + i
+        driver_row(g, seg_label(ar), seg[2], "growth", FMT_PCT, GREEN)
+        driver_row(m, seg_label(ar), seg[3], "margin", FMT_PCT, GREEN)
+        repoint(f"D{ar}", g, FMT_PCT)
+        repoint(f"E{ar}", m, FMT_PCT)
+
+    section(ws, SC_DAYS_HDR, "Working Capital Days (projection years)")
+    for first, name, a_row, example, shift in ((SC_DSO_FIRST, "DSO", A_DSO, EXAMPLE_DSO, "dso"),
+                                               (SC_DIO_FIRST, "DIO", A_DIO, EXAMPLE_DIO, "dio"),
+                                               (SC_DPO_FIRST, "DPO", A_DPO, EXAMPLE_DPO, "dpo")):
+        for j, col in enumerate(PROJ_COLS):
+            r = first + j
+            driver_row(r, f'="{name} - "&{S}!{col}${S_FY}', example[j + 1], shift, FMT_DAYS, GREEN)
+            repoint(f"{col}{a_row}", r, FMT_DAYS)
+
+    section(ws, SC_OTHER_HDR, "Capex, WACC & Terminal Value")
+    for r, label, a_row, base, shift, fmt in (
+            (SC_MAINT, "Maintenance Capex (% of Revenue)", A_MAINT, EXAMPLE_MAINT_CAPEX, "maint", FMT_PCT),
+            (SC_BETA, "Levered Beta", A_BETA, EXAMPLE_BETA, "beta", FMT_BETA),
+            (SC_TGR, "Terminal Growth Rate", A_DCF_TGR, EXAMPLE_DCF_TGR, "tgr", FMT_PCT),
+            (SC_EXIT, "Exit EV/EBITDA Multiple", A_EXIT_MULT, EXAMPLE_EXIT_MULT, "exit", FMT_MULT)):
+        driver_row(r, label, base, shift, fmt)
+        repoint(f"C{a_row}", r, fmt)
+
+    # Static snapshot written by main() after recalculating each scenario in LibreOffice
+    section(ws, SC_SUM_HDR, "Scenario Summary (snapshot values, rerun script to refresh)")
+    for col, text in zip("BCDE", ("Output",) + SCENARIOS):
+        c = put(ws, f"{col}{SC_SUM_COLS}", text, bold=True, fill=HEADER_FILL)
+        c.alignment = Alignment(horizontal="left" if col == "B" else "right")
+    for k, (r, label, fmt) in enumerate(((SC_EV_PGM, "Enterprise Value - Perpetuity Growth ($mm)", FMT_USD),
+                                         (SC_EV_EXIT, "Enterprise Value - Exit Multiple ($mm)", FMT_USD),
+                                         (SC_PX_PGM, "Implied Share Price - Perpetuity Growth ($)", FMT_PRICE),
+                                         (SC_PX_EXIT, "Implied Share Price - Exit Multiple ($)", FMT_PRICE))):
+        put(ws, f"B{r}", label)
+        for col, name in zip("CDE", SCENARIOS):
+            put(ws, f"{col}{r}", snapshot[name][k] if snapshot else None, fmt=fmt)
+
+
+def build_sensitivity(wb):
+    ws = wb.create_sheet(SN)
+    ws.sheet_view.showGridLines = False
+    ws.column_dimensions["A"].width = 2
+    ws.column_dimensions["B"].width = 30
+    for col in GRID_COLS:
+        ws.column_dimensions[col].width = 12
+    put(ws, "B1", '=CompanyName&" - Sensitivity Analysis"', bold=True, size=14)
+    put(ws, "B2", f'="(Implied share price, $ per share; centered on the live "&{A}!$C${A_SCEN}&" case)"',
+        italic=True)
+
+    section(ws, SN_STEP_HDR, "Grid Steps", last="G")
+    for r, label, val, fmt in ((SN_STEP_WACC, "WACC Step", SENS_STEPS[0], FMT_PCT),
+                               (SN_STEP_TGR, "Terminal Growth Step", SENS_STEPS[1], FMT_PCT),
+                               (SN_STEP_MULT, "Exit Multiple Step", SENS_STEPS[2], FMT_MULT)):
+        put(ws, f"B{r}", label)
+        put(ws, f"C{r}", val, color=BLUE, fmt=fmt, fill=INPUT_FILL)
+
+    # Shared pieces of each grid cell's formula (all from the DCF tab)
+    pv_fcf = f"SUMPRODUCT({D}!$D${D_UFCF}:$H${D_UFCF}/(1+{{w}})^{D}!$D${D_PERIOD}:$H${D_PERIOD})"
+    shares = {"C": f"{D}!$C${D_SHARES}", "D": f"{D}!$D${D_SHARES}"}
+    grids = (
+        (SN_PGM_HDR, SN_PGM_AXIS, SN_PGM_FIRST, "Perpetuity Growth Method: WACC vs. Terminal Growth",
+         "WACC \\ Terminal Growth", f"{D}!$C${D_TV_G}", SN_STEP_TGR, FMT_PCT,
+         lambda w, x: (f"=IF(OR({w}<={x},{shares['C']}=0),0,({pv_fcf.format(w=w)}"
+                       f"+{D}!$C${D_TV_FCF}*(1+{x})/({w}-{x})/(1+{w})^{D}!$C${D_TV_PERIOD}"
+                       f"+{D}!$C${D_NET_DEBT})/{shares['C']})")),
+        (SN_EXIT_HDR, SN_EXIT_AXIS, SN_EXIT_FIRST, "Exit Multiple Method: WACC vs. Exit EV/EBITDA Multiple",
+         "WACC \\ Exit Multiple", f"{D}!$D${D_TV_MULT}", SN_STEP_MULT, FMT_MULT,
+         lambda w, x: (f"=IF({shares['D']}=0,0,({pv_fcf.format(w=w)}"
+                       f"+{D}!$D${D_TV_EBITDA}*{x}/(1+{w})^{D}!$D${D_TV_PERIOD}"
+                       f"+{D}!$D${D_NET_DEBT})/{shares['D']})")),
+    )
+    mid_col = GRID_COLS[GRID_MID]
+    for hdr, axis, first, title, corner, live_x, step_row, x_fmt, cell_formula in grids:
+        section(ws, hdr, f"Implied Share Price - {title}", last="G")
+        put(ws, f"B{axis}", corner, bold=True, fill=HEADER_FILL)
+        mid_row = first + GRID_MID
+        for k, col in enumerate(GRID_COLS):
+            off = k - GRID_MID
+            if off == 0:
+                put(ws, f"{col}{axis}", f"={live_x}", color=GREEN, fmt=x_fmt, bold=True, fill=HEADER_FILL)
+            else:
+                put(ws, f"{col}{axis}", f"=${mid_col}${axis}{off:+d}*$C${step_row}", fmt=x_fmt, bold=True,
+                    fill=HEADER_FILL)
+        for k in range(len(GRID_COLS)):
+            r, off = first + k, k - GRID_MID
+            if off == 0:
+                put(ws, f"B{r}", f"={D}!$C${D_RATE}", color=GREEN, fmt=FMT_PCT, bold=True, fill=HEADER_FILL)
+            else:
+                put(ws, f"B{r}", f"=$B${mid_row}{off:+d}*$C${SN_STEP_WACC}", fmt=FMT_PCT, bold=True,
+                    fill=HEADER_FILL)
+            for col in GRID_COLS:
+                put(ws, f"{col}{r}", cell_formula(f"$B{r}", f"{col}${axis}"), fmt=FMT_PRICE)
+        put(ws, f"{mid_col}{mid_row}", ws[f"{mid_col}{mid_row}"].value, fmt=FMT_PRICE, bold=True,
+            fill=CENTER_FILL)
+
+
+def build_workbook(active, snapshot=None):
     wb = Workbook()
     build_assumptions(wb)
     build_segment_revenue(wb)
@@ -771,7 +956,44 @@ def main():
     add_wacc_dcf_inputs(wb)
     build_wacc(wb)
     build_dcf(wb)
-    wb.save(OUT)
+    build_scenarios(wb, active, snapshot)
+    build_sensitivity(wb)
+    return wb
+
+
+def find_soffice():
+    for cand in ("soffice", "libreoffice", "/Applications/LibreOffice.app/Contents/MacOS/soffice"):
+        path = shutil.which(cand)
+        if path:
+            return path
+    sys.exit("LibreOffice (soffice) not found on PATH; it is required to recalculate the scenarios.")
+
+
+def recalc(src, out_dir, soffice, profile):
+    """Recalculate every formula via a headless LibreOffice convert; returns the recalculated copy."""
+    subprocess.run([soffice, "--headless", "--calc", f"-env:UserInstallation={profile.as_uri()}",
+                    "--convert-to", "xlsx", "--outdir", str(out_dir), str(src)],
+                   check=True, capture_output=True, timeout=300)
+    return out_dir / src.name
+
+
+def main():
+    soffice = find_soffice()
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        src_dir, out_dir, profile = tmp / "src", tmp / "out", tmp / "lo_profile"
+        src_dir.mkdir()
+        snapshot = {}
+        for name in SCENARIOS:
+            src = src_dir / f"{name}.xlsx"
+            build_workbook(name).save(src)
+            dcf = load_workbook(recalc(src, out_dir, soffice, profile), data_only=True)[D]
+            snapshot[name] = [dcf[f"C{D_EV}"].value, dcf[f"D{D_EV}"].value,
+                              dcf[f"C{D_PRICE}"].value, dcf[f"D{D_PRICE}"].value]
+            print(f"{name}: share price {snapshot[name][2]:.2f} (perpetuity) / {snapshot[name][3]:.2f} (exit)")
+        src = src_dir / OUT.name
+        build_workbook("Base", snapshot).save(src)
+        shutil.copyfile(recalc(src, out_dir, soffice, profile), OUT)
     print(f"Saved {OUT}")
 
 
